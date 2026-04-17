@@ -1,6 +1,12 @@
 """Clean Kokoro implementation with controlled resource management."""
 
+import asyncio
 import os
+import re
+import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import AsyncGenerator, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -25,6 +31,18 @@ class KokoroV1(BaseModelBackend):
         self._device = settings.get_device()
         self._model: Optional[KModel] = None
         self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
+        self._pipeline_lock = threading.Lock()
+        self._worker_pipelines: Dict[Tuple[int, str], KPipeline] = {}
+        self._voice_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._voice_cache_lock = threading.Lock()
+        self._thread_local = threading.local()
+        self._workers = max(1, settings.gpu_inference_workers)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._workers, thread_name_prefix="kokoro-infer"
+        )
+        self._inference_semaphore = asyncio.Semaphore(
+            max(1, settings.gpu_inference_concurrency)
+        )
 
     async def load_model(self, path: str) -> None:
         """Load pre-baked model.
@@ -65,6 +83,25 @@ class KokoroV1(BaseModelBackend):
         except Exception as e:
             raise RuntimeError(f"Failed to load Kokoro model: {e}")
 
+    async def warmup_workers(self, lang_code: str) -> None:
+        """Create per-thread G2P pipelines before serving concurrent traffic."""
+        if not self.is_loaded or self._workers <= 1:
+            return
+
+        barrier = threading.Barrier(self._workers)
+
+        def warmup_worker():
+            barrier.wait()
+            self._get_worker_pipeline(lang_code)
+
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(
+            *[
+                loop.run_in_executor(self._executor, warmup_worker)
+                for _ in range(self._workers)
+            ]
+        )
+
     def _get_pipeline(self, lang_code: str) -> KPipeline:
         """Get or create pipeline for language code.
 
@@ -78,11 +115,251 @@ class KokoroV1(BaseModelBackend):
             raise RuntimeError("Model not loaded")
 
         if lang_code not in self._pipelines:
-            logger.info(f"Creating new pipeline for language code: {lang_code}")
-            self._pipelines[lang_code] = KPipeline(
-                lang_code=lang_code, model=self._model, device=self._device
-            )
+            with self._pipeline_lock:
+                if lang_code not in self._pipelines:
+                    logger.info(f"Creating new pipeline for language code: {lang_code}")
+                    self._pipelines[lang_code] = KPipeline(
+                        lang_code=lang_code, model=self._model, device=self._device
+                    )
         return self._pipelines[lang_code]
+
+    def _get_worker_pipeline(self, lang_code: str) -> KPipeline:
+        """Get a per-worker text pipeline so concurrent G2P state is isolated."""
+        key = (threading.get_ident(), lang_code)
+        pipeline = self._worker_pipelines.get(key)
+        if pipeline is None:
+            with self._pipeline_lock:
+                pipeline = self._worker_pipelines.get(key)
+                if pipeline is None:
+                    logger.info(
+                        f"Creating worker pipeline for language code: {lang_code}"
+                    )
+                    pipeline = KPipeline(
+                        lang_code=lang_code, model=False, device=self._device
+                    )
+                    self._worker_pipelines[key] = pipeline
+        return pipeline
+
+    def _get_cuda_stream(self):
+        """Return a CUDA stream local to each inference worker."""
+        if self._device != "cuda" or not settings.gpu_use_streams:
+            return None
+        stream = getattr(self._thread_local, "cuda_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream()
+            self._thread_local.cuda_stream = stream
+        return stream
+
+    def _load_voice_pack(self, voice_path: str) -> torch.Tensor:
+        """Load and cache a voice pack on the target device."""
+        if not model_config.cache_voices:
+            return torch.load(voice_path, weights_only=True).to(self._device)
+
+        with self._voice_cache_lock:
+            cached = self._voice_cache.get(voice_path)
+            if cached is not None:
+                self._voice_cache.move_to_end(voice_path)
+                return cached
+
+        pack = torch.load(voice_path, weights_only=True).to(self._device)
+
+        with self._voice_cache_lock:
+            cached = self._voice_cache.get(voice_path)
+            if cached is not None:
+                self._voice_cache.move_to_end(voice_path)
+                return cached
+            self._voice_cache[voice_path] = pack
+            max_size = max(1, model_config.voice_cache_size)
+            while len(self._voice_cache) > max_size:
+                self._voice_cache.popitem(last=False)
+        return pack
+
+    def _resolve_voice_path(
+        self, voice: Union[str, Tuple[str, Union[torch.Tensor, str]]]
+    ) -> Tuple[str, str]:
+        """Normalize voice input to a name and path usable by Kokoro."""
+        if isinstance(voice, tuple):
+            voice_name, voice_data = voice
+            if isinstance(voice_data, str):
+                return voice_name, voice_data
+
+            import tempfile
+
+            voice_path = os.path.join(tempfile.gettempdir(), f"{voice_name}.pt")
+            torch.save(voice_data.cpu(), voice_path)
+            return voice_name, voice_path
+
+        return os.path.splitext(os.path.basename(voice))[0], voice
+
+    def _pipeline_lang_code(self, voice_name: str, lang_code: Optional[str]) -> str:
+        if lang_code:
+            return lang_code
+        if settings.default_voice_code:
+            return settings.default_voice_code
+        return voice_name[0].lower()
+
+    def _iter_text_segments(self, pipeline: KPipeline, text: str):
+        """Tokenize text like KPipeline.__call__, but leave inference to us."""
+        grapheme_chunks = re.split(r"\n+", text.strip()) if text.strip() else []
+        for graphemes_index, graphemes in enumerate(grapheme_chunks):
+            if not graphemes.strip():
+                continue
+
+            if pipeline.lang_code in "ab":
+                logger.debug(
+                    f"Processing English text: {graphemes[:50]}{'...' if len(graphemes) > 50 else ''}"
+                )
+                _, tokens = pipeline.g2p(graphemes)
+                for gs, ps, tks in pipeline.en_tokenize(tokens):
+                    if not ps:
+                        continue
+                    if len(ps) > 510:
+                        logger.warning(
+                            f"Unexpected len(ps) == {len(ps)} > 510 and ps == '{ps}'"
+                        )
+                        ps = ps[:510]
+                    yield gs, ps, tks, graphemes_index
+                continue
+
+            chunk_size = 400
+            chunks = []
+            sentences = re.split(r"([.!?]+)", graphemes)
+            current_chunk = ""
+
+            for i in range(0, len(sentences), 2):
+                sentence = sentences[i]
+                if i + 1 < len(sentences):
+                    sentence += sentences[i + 1]
+
+                if len(current_chunk) + len(sentence) <= chunk_size:
+                    current_chunk += sentence
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = sentence
+
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+
+            if not chunks:
+                chunks = [
+                    graphemes[i : i + chunk_size]
+                    for i in range(0, len(graphemes), chunk_size)
+                ]
+
+            for chunk in chunks:
+                if not chunk.strip():
+                    continue
+                ps, _ = pipeline.g2p(chunk)
+                if not ps:
+                    continue
+                if len(ps) > 510:
+                    logger.warning(f"Truncating len(ps) == {len(ps)} > 510")
+                    ps = ps[:510]
+                yield chunk, ps, None, graphemes_index
+
+    def _timestamps_from_tokens(self, tokens, pred_dur) -> Optional[list[WordTimestamp]]:
+        if not tokens or pred_dur is None:
+            return None
+
+        word_timestamps = []
+        try:
+            KPipeline.join_timestamps(tokens, pred_dur)
+            for token in tokens:
+                if not all(
+                    hasattr(token, attr) for attr in ["text", "start_ts", "end_ts"]
+                ):
+                    continue
+                if not token.text or not token.text.strip():
+                    continue
+                word_timestamps.append(
+                    WordTimestamp(
+                        word=str(token.text).strip(),
+                        start_time=float(token.start_ts),
+                        end_time=float(token.end_ts),
+                    )
+                )
+        except Exception as e:
+            logger.error(f"Failed to process timestamps for chunk: {e}")
+
+        return word_timestamps or None
+
+    def _infer_phonemes_sync(
+        self, phonemes: str, pack: torch.Tensor, speed: float
+    ) -> KModel.Output:
+        """Infer one phoneme string using the configured Kokoro model."""
+        if not self._model:
+            raise RuntimeError("Model not loaded")
+        return KPipeline.infer(self._model, phonemes, pack, speed)
+
+    def _generate_text_sync(
+        self,
+        text: str,
+        voice_path: str,
+        speed: float,
+        pipeline_lang_code: str,
+        return_timestamps: bool,
+    ) -> list[AudioChunk]:
+        if not self._model:
+            raise RuntimeError("Model not loaded")
+
+        pipeline = self._get_worker_pipeline(pipeline_lang_code)
+        pack = self._load_voice_pack(voice_path)
+        stream = self._get_cuda_stream()
+        stream_context = (
+            torch.cuda.stream(stream) if stream is not None else nullcontext()
+        )
+        chunks = []
+
+        with torch.inference_mode(), stream_context:
+            for _, phonemes, tokens, _ in self._iter_text_segments(pipeline, text):
+                output = self._infer_phonemes_sync(phonemes, pack, speed)
+                if output.audio is None:
+                    logger.warning("No audio in chunk")
+                    continue
+
+                logger.debug(f"Got audio chunk with shape: {output.audio.shape}")
+                word_timestamps = (
+                    self._timestamps_from_tokens(tokens, output.pred_dur)
+                    if return_timestamps
+                    else None
+                )
+                chunks.append(
+                    AudioChunk(output.audio.numpy(), word_timestamps=word_timestamps)
+                )
+
+        return chunks
+
+    def _generate_tokens_sync(
+        self,
+        tokens: str,
+        voice_path: str,
+        speed: float,
+        pipeline_lang_code: str,
+    ) -> list[np.ndarray]:
+        if not self._model:
+            raise RuntimeError("Model not loaded")
+
+        pack = self._load_voice_pack(voice_path)
+        stream = self._get_cuda_stream()
+        stream_context = (
+            torch.cuda.stream(stream) if stream is not None else nullcontext()
+        )
+        chunks = []
+
+        with torch.inference_mode(), stream_context:
+            if len(tokens) > 510:
+                raise ValueError(f"Phoneme string too long: {len(tokens)} > 510")
+            output = self._infer_phonemes_sync(tokens, pack, speed)
+            if output.audio is not None:
+                chunks.append(output.audio.numpy())
+
+        return chunks
+
+    async def _run_inference(self, func, *args):
+        async with self._inference_semaphore:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, func, *args)
 
     async def generate_from_tokens(
         self,
@@ -109,65 +386,25 @@ class KokoroV1(BaseModelBackend):
             raise RuntimeError("Model not loaded")
 
         try:
-            # Memory management for GPU
             if self._device == "cuda":
                 if self._check_memory():
                     self._clear_memory()
 
-            # Handle voice input
-            voice_path: str
-            voice_name: str
-            if isinstance(voice, tuple):
-                voice_name, voice_data = voice
-                if isinstance(voice_data, str):
-                    voice_path = voice_data
-                else:
-                    # Save tensor to temporary file
-                    import tempfile
-
-                    temp_dir = tempfile.gettempdir()
-                    voice_path = os.path.join(temp_dir, f"{voice_name}.pt")
-                    # Save tensor with CPU mapping for portability
-                    torch.save(voice_data.cpu(), voice_path)
-            else:
-                voice_path = voice
-                voice_name = os.path.splitext(os.path.basename(voice_path))[0]
-
-            # Load voice tensor with proper device mapping
-            voice_tensor = await paths.load_voice_tensor(
-                voice_path, device=self._device
-            )
-            # Save back to a temporary file with proper device mapping
-            import tempfile
-
-            temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(
-                temp_dir, f"temp_voice_{os.path.basename(voice_path)}"
-            )
-            await paths.save_voice_tensor(voice_tensor, temp_path)
-            voice_path = temp_path
-
-            # Use provided lang_code, settings voice code override, or first letter of voice name
-            if lang_code:  # api is given priority
-                pipeline_lang_code = lang_code
-            elif settings.default_voice_code:  # settings is next priority
-                pipeline_lang_code = settings.default_voice_code
-            else:  # voice name is default/fallback
-                pipeline_lang_code = voice_name[0].lower()
-
-            pipeline = self._get_pipeline(pipeline_lang_code)
+            voice_name, voice_path = self._resolve_voice_path(voice)
+            pipeline_lang_code = self._pipeline_lang_code(voice_name, lang_code)
 
             logger.debug(
                 f"Generating audio from tokens with lang_code '{pipeline_lang_code}': '{tokens[:100]}{'...' if len(tokens) > 100 else ''}'"
             )
-            for result in pipeline.generate_from_tokens(
-                tokens=tokens, voice=voice_path, speed=speed, model=self._model
-            ):
-                if result.audio is not None:
-                    logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
-                    yield result.audio.numpy()
-                else:
-                    logger.warning("No audio in chunk")
+            chunks = await self._run_inference(
+                self._generate_tokens_sync,
+                tokens,
+                voice_path,
+                speed,
+                pipeline_lang_code,
+            )
+            for chunk in chunks:
+                yield chunk
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
@@ -208,114 +445,26 @@ class KokoroV1(BaseModelBackend):
         if not self.is_loaded:
             raise RuntimeError("Model not loaded")
         try:
-            # Memory management for GPU
             if self._device == "cuda":
                 if self._check_memory():
                     self._clear_memory()
 
-            # Handle voice input
-            voice_path: str
-            voice_name: str
-            if isinstance(voice, tuple):
-                voice_name, voice_data = voice
-                if isinstance(voice_data, str):
-                    voice_path = voice_data
-                else:
-                    # Save tensor to temporary file
-                    import tempfile
-
-                    temp_dir = tempfile.gettempdir()
-                    voice_path = os.path.join(temp_dir, f"{voice_name}.pt")
-                    # Save tensor with CPU mapping for portability
-                    torch.save(voice_data.cpu(), voice_path)
-            else:
-                voice_path = voice
-                voice_name = os.path.splitext(os.path.basename(voice_path))[0]
-
-            # Load voice tensor with proper device mapping
-            voice_tensor = await paths.load_voice_tensor(
-                voice_path, device=self._device
-            )
-            # Save back to a temporary file with proper device mapping
-            import tempfile
-
-            temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(
-                temp_dir, f"temp_voice_{os.path.basename(voice_path)}"
-            )
-            await paths.save_voice_tensor(voice_tensor, temp_path)
-            voice_path = temp_path
-
-            # Use provided lang_code, settings voice code override, or first letter of voice name
-            pipeline_lang_code = (
-                lang_code
-                if lang_code
-                else (
-                    settings.default_voice_code
-                    if settings.default_voice_code
-                    else voice_name[0].lower()
-                )
-            )
-            pipeline = self._get_pipeline(pipeline_lang_code)
+            voice_name, voice_path = self._resolve_voice_path(voice)
+            pipeline_lang_code = self._pipeline_lang_code(voice_name, lang_code)
 
             logger.debug(
                 f"Generating audio for text with lang_code '{pipeline_lang_code}': '{text[:100]}{'...' if len(text) > 100 else ''}'"
             )
-            for result in pipeline(
-                text, voice=voice_path, speed=speed, model=self._model
-            ):
-                if result.audio is not None:
-                    logger.debug(f"Got audio chunk with shape: {result.audio.shape}")
-                    word_timestamps = None
-                    if (
-                        return_timestamps
-                        and hasattr(result, "tokens")
-                        and result.tokens
-                    ):
-                        word_timestamps = []
-                        current_offset = 0.0
-                        logger.debug(
-                            f"Processing chunk timestamps with {len(result.tokens)} tokens"
-                        )
-                        if result.pred_dur is not None:
-                            try:
-                                # Add timestamps with offset
-                                for token in result.tokens:
-                                    if not all(
-                                        hasattr(token, attr)
-                                        for attr in [
-                                            "text",
-                                            "start_ts",
-                                            "end_ts",
-                                        ]
-                                    ):
-                                        continue
-                                    if not token.text or not token.text.strip():
-                                        continue
-
-                                    start_time = float(token.start_ts) + current_offset
-                                    end_time = float(token.end_ts) + current_offset
-                                    word_timestamps.append(
-                                        WordTimestamp(
-                                            word=str(token.text).strip(),
-                                            start_time=start_time,
-                                            end_time=end_time,
-                                        )
-                                    )
-                                    logger.debug(
-                                        f"Added timestamp for word '{token.text}': {start_time:.3f}s - {end_time:.3f}s"
-                                    )
-
-                            except Exception as e:
-                                logger.error(
-                                    f"Failed to process timestamps for chunk: {e}"
-                                )
-
-                    yield AudioChunk(
-                        result.audio.numpy(), word_timestamps=word_timestamps
-                    )
-                else:
-                    logger.warning("No audio in chunk")
+            chunks = await self._run_inference(
+                self._generate_text_sync,
+                text,
+                voice_path,
+                speed,
+                pipeline_lang_code,
+                bool(return_timestamps),
+            )
+            for chunk in chunks:
+                yield chunk
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
@@ -355,6 +504,12 @@ class KokoroV1(BaseModelBackend):
         for pipeline in self._pipelines.values():
             del pipeline
         self._pipelines.clear()
+        for pipeline in self._worker_pipelines.values():
+            del pipeline
+        self._worker_pipelines.clear()
+        with self._voice_cache_lock:
+            self._voice_cache.clear()
+        self._executor.shutdown(wait=False, cancel_futures=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()

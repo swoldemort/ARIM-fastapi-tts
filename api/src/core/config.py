@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     device_type: str | None = (
         None  # Will be auto-detected if None, can be "cuda", "mps", or "cpu"
     )
+    gpu_inference_concurrency: int = 2  # Small overlap without heavy CUDA contention
+    gpu_inference_workers: int = 2  # Match the GPU inference semaphore
+    gpu_use_streams: bool = False  # Streams hurt latency without batched inference
     allow_local_voice_saving: bool = (
         False  # Whether to allow saving combined voices locally
     )

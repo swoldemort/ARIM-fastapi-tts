@@ -77,6 +77,7 @@ class ModelManager:
                 logger.debug(f"Using default voice '{voice_name}' for warmup")
                 async for _ in self.generate(warmup_text, (voice_name, voice_path)):
                     pass
+                await self._backend.warmup_workers(voice_name[:1].lower())
             except Exception as e:
                 raise RuntimeError(f"Failed to get default voice: {e}")
 

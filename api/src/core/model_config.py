@@ -32,7 +32,7 @@ class ModelConfig(BaseModel):
 
     # General settings
     cache_voices: bool = Field(True, description="Whether to cache voice tensors")
-    voice_cache_size: int = Field(2, description="Maximum number of cached voices")
+    voice_cache_size: int = Field(16, description="Maximum number of cached voices")
 
     # Model filename
     pytorch_kokoro_v1_file: str = Field(

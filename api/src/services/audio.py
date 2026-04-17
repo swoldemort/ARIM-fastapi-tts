@@ -76,22 +76,14 @@ class AudioNormalizer:
         amplitude_threshold = np.iinfo(audio_data.dtype).max * (
             10 ** (silence_threshold_db / 20)
         )
-        # Find the first samples above the silence threshold at the start and end of the audio
-        non_silent_index_start, non_silent_index_end = None, None
-
-        for X in range(0, len(audio_data)):
-            if abs(audio_data[X]) > amplitude_threshold:
-                non_silent_index_start = X
-                break
-
-        for X in range(len(audio_data) - 1, -1, -1):
-            if abs(audio_data[X]) > amplitude_threshold:
-                non_silent_index_end = X
-                break
+        non_silent_indices = np.flatnonzero(np.abs(audio_data) > amplitude_threshold)
 
         # Handle the case where the entire audio is silent
-        if non_silent_index_start == None or non_silent_index_end == None:
+        if len(non_silent_indices) == 0:
             return 0, len(audio_data)
+
+        non_silent_index_start = int(non_silent_indices[0])
+        non_silent_index_end = int(non_silent_indices[-1])
 
         return max(non_silent_index_start - self.samples_to_pad_start, 0), min(
             non_silent_index_end + math.ceil(samples_to_pad_end / speed),

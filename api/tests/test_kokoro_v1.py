@@ -1,8 +1,6 @@
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-import numpy as np
 import pytest
-import torch
 
 from api.src.inference.kokoro_v1 import KokoroV1
 
@@ -129,37 +127,21 @@ def test_get_pipeline_reuses_existing(kokoro_backend):
 
 @pytest.mark.asyncio
 async def test_generate_uses_correct_pipeline(kokoro_backend):
-    """Test that generate uses correct pipeline for language code."""
+    """Test that generate schedules worker inference with the correct language code."""
     # Mock loaded state
     kokoro_backend._model = MagicMock()
 
-    # Mock voice path handling
-    with (
-        patch("api.src.core.paths.load_voice_tensor") as mock_load_voice,
-        patch("api.src.core.paths.save_voice_tensor"),
-        patch("tempfile.gettempdir") as mock_tempdir,
-    ):
-        mock_load_voice.return_value = torch.ones(1)
-        mock_tempdir.return_value = "/tmp"
+    with patch.object(kokoro_backend, "_run_inference", new_callable=AsyncMock) as run:
+        run.return_value = []
 
-        # Mock KPipeline
-        mock_pipeline = MagicMock()
-        mock_pipeline.return_value = iter([])  # Empty generator for testing
-        with patch("api.src.inference.kokoro_v1.KPipeline", return_value=mock_pipeline):
-            # Generate with Spanish voice and explicit lang_code
-            async for _ in kokoro_backend.generate("test", "ef_voice", lang_code="e"):
-                pass
+        async for _ in kokoro_backend.generate("test", "ef_voice", lang_code="e"):
+            pass
 
-            # Should create pipeline with Spanish lang_code
-            assert "e" in kokoro_backend._pipelines
-            # Use ANY to match the temp file path since it's dynamic
-            mock_pipeline.assert_called_with(
-                "test",
-                voice=ANY,  # Don't check exact path since it's dynamic
-                speed=1.0,
-                model=kokoro_backend._model,
-            )
-            # Verify the voice path is a temp file path
-            call_args = mock_pipeline.call_args
-            assert isinstance(call_args[1]["voice"], str)
-            assert call_args[1]["voice"].startswith("/tmp/temp_voice_")
+        run.assert_awaited_once()
+        call_args = run.await_args.args
+        assert call_args[0] == kokoro_backend._generate_text_sync
+        assert call_args[1] == "test"
+        assert call_args[2] == "ef_voice"
+        assert call_args[3] == 1.0
+        assert call_args[4] == "e"
+        assert call_args[5] is False

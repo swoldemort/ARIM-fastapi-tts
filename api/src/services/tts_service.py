@@ -27,7 +27,7 @@ from .text_processing.text_processor import process_text_chunk, smart_split
 class TTSService:
     """Text-to-speech service."""
 
-    # Limit concurrent chunk processing
+    # Limit request chunk work separately from the GPU inference queue.
     _chunk_semaphore = asyncio.Semaphore(4)
 
     def __init__(self, output_dir: str = None):
@@ -479,26 +479,23 @@ class TTSService:
                 )
 
                 try:
-                    # Use backend's pipeline management
-                    for r in backend._get_pipeline(
-                        pipeline_lang_code
-                    ).generate_from_tokens(
-                        tokens=phonemes,  # Pass raw phonemes string
-                        voice=voice_path,
+                    async for audio in backend.generate_from_tokens(
+                        phonemes,
+                        (voice_name, voice_path),
                         speed=speed,
+                        lang_code=pipeline_lang_code,
                     ):
-                        if r.audio is not None:
-                            result = r
-                            break
+                        result = audio
+                        break
                 except Exception as e:
                     logger.error(f"Failed to generate from phonemes: {e}")
                     raise RuntimeError(f"Phoneme generation failed: {e}")
 
-                if result is None or result.audio is None:
+                if result is None:
                     raise ValueError("No audio generated")
 
                 processing_time = time.time() - start_time
-                return result.audio.numpy(), processing_time
+                return result, processing_time
             else:
                 raise ValueError(
                     "Phoneme generation only supported with Kokoro V1 backend"
