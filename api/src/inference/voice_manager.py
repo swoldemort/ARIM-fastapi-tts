@@ -21,6 +21,7 @@ class VoiceManager:
         # Strictly respect settings.use_gpu
         self._device = settings.get_device()
         self._voices: Dict[str, torch.Tensor] = {}
+        self._voice_names: Optional[List[str]] = None
 
     async def get_voice_path(self, voice_name: str) -> str:
         """Get path to voice file.
@@ -93,7 +94,9 @@ class VoiceManager:
         Returns:
             List of voice names
         """
-        return await paths.list_voices()
+        if self._voice_names is None:
+            self._voice_names = await paths.list_voices()
+        return self._voice_names
 
     def cache_info(self) -> Dict[str, int]:
         """Get cache statistics.

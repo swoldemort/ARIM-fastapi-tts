@@ -281,7 +281,7 @@ class TTSService:
 
             # Use provided lang_code or determine from voice name
             pipeline_lang_code = lang_code if lang_code else voice[:1].lower()
-            logger.info(
+            logger.debug(
                 f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in audio stream"
             )
 
@@ -474,7 +474,7 @@ class TTSService:
                 result = None
                 # Use provided lang_code or determine from voice name
                 pipeline_lang_code = lang_code if lang_code else voice[:1].lower()
-                logger.info(
+                logger.debug(
                     f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in phoneme pipeline"
                 )
 

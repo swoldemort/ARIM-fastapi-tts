@@ -8,15 +8,19 @@ services:
     volumes:
       - ../../api:/app/api
     user: "1001:1001"  # Ensure container runs as UID 1001 (appuser)
-    command: ["uv", "run", "--extra", "gpu", "--no-sync", "python", "-m", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8880", "--log-level", "info"]
+    command: ["uv", "run", "--extra", "gpu", "--no-sync", "python", "-m", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8880", "--loop", "uvloop", "--http", "httptools", "--no-access-log", "--log-level", "info"]
     ports:
       - "8880:8880"
     environment:
       - PYTHONPATH=/app:/app/api
       - USE_GPU=true
+      - DEVICE_TYPE=cuda:0
+      - AMP_DTYPE=fp32
+      - USE_INFERENCE_MODE=true
       - GPU_INFERENCE_CONCURRENCY=2
       - GPU_INFERENCE_WORKERS=2
       - GPU_USE_STREAMS=false
+      - TEMP_FILE_DIR=/tmp/kokoro_temp_files
       - PYTHONUNBUFFERED=1
       - API_LOG_LEVEL=INFO
       - UVICORN_LOG_LEVEL=info

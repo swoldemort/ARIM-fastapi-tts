@@ -19,8 +19,10 @@ class Settings(BaseSettings):
     )
     use_gpu: bool = True  # Whether to use GPU acceleration if available
     device_type: str | None = (
-        None  # Will be auto-detected if None, can be "cuda", "mps", or "cpu"
+        None  # Auto-detected if None; accepts "cuda", "cuda:0", "mps", or "cpu"
     )
+    amp_dtype: str = "fp32"  # fp32 | fp16 | bf16
+    use_inference_mode: bool = True
     gpu_inference_concurrency: int = 2  # Small overlap without heavy CUDA contention
     gpu_inference_workers: int = 2  # Match the GPU inference semaphore
     gpu_use_streams: bool = False  # Streams hurt latency without batched inference
@@ -35,6 +37,7 @@ class Settings(BaseSettings):
     # Audio Settings
     sample_rate: int = 24000
     default_volume_multiplier: float = 1.0
+    mp3_bitrate: int = 128000
     # Text Processing Settings
     target_min_tokens: int = 175  # Target minimum tokens per chunk
     target_max_tokens: int = 250  # Target maximum tokens per chunk
@@ -82,7 +85,7 @@ class Settings(BaseSettings):
         if torch.backends.mps.is_available():
             return "mps"
         elif torch.cuda.is_available():
-            return "cuda"
+            return "cuda:0"
         return "cpu"
 
 

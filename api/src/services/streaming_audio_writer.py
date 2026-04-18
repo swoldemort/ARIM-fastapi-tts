@@ -10,6 +10,8 @@ import soundfile as sf
 from loguru import logger
 from pydub import AudioSegment
 
+from ..core.config import settings
+
 
 class StreamingAudioWriter:
     """Handles streaming audio format conversions"""
@@ -23,7 +25,7 @@ class StreamingAudioWriter:
 
         codec_map = {
             "wav": "pcm_s16le",
-            "mp3": "mp3",
+            "mp3": "libmp3lame",
             "opus": "libopus",
             "flac": "flac",
             "aac": "aac",
@@ -51,7 +53,9 @@ class StreamingAudioWriter:
                     layout="mono" if self.channels == 1 else "stereo",
                 )
                 # Set bit_rate only for codecs where it's applicable and useful
-                if self.format in ['mp3', 'aac', 'opus']:
+                if self.format == "mp3":
+                    self.stream.bit_rate = settings.mp3_bitrate
+                elif self.format in ['aac', 'opus']:
                     self.stream.bit_rate = 128000
         else:
             raise ValueError(f"Unsupported format: {self.format}") # Use self.format here

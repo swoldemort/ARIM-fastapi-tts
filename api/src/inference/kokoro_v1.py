@@ -29,6 +29,11 @@ class KokoroV1(BaseModelBackend):
         super().__init__()
         # Strictly respect settings.use_gpu
         self._device = settings.get_device()
+        self._torch_device = torch.device(self._device)
+        self._is_cuda = self._torch_device.type == "cuda"
+        self._amp_dtype = self._resolve_amp_dtype(settings.amp_dtype)
+        if self._is_cuda:
+            torch.cuda.set_device(self._torch_device)
         self._model: Optional[KModel] = None
         self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
         self._pipeline_lock = threading.Lock()
@@ -65,23 +70,43 @@ class KokoroV1(BaseModelBackend):
             logger.info(f"Config path: {config_path}")
             logger.info(f"Model path: {model_path}")
 
-            # Load model and let KModel handle device mapping
+            # Load model and pin it to the configured device. This supports
+            # explicit CUDA devices such as "cuda:0", not only bare "cuda".
             self._model = KModel(config=config_path, model=model_path).eval()
-            # For MPS, manually move ISTFT layers to CPU while keeping rest on MPS
-            if self._device == "mps":
-                logger.info(
-                    "Moving model to MPS device with CPU fallback for unsupported operations"
-                )
-                self._model = self._model.to(torch.device("mps"))
-            elif self._device == "cuda":
-                self._model = self._model.cuda()
-            else:
-                self._model = self._model.cpu()
+            if self._torch_device.type == "mps":
+                logger.info("Moving model to MPS device")
+            self._model = self._model.to(self._torch_device)
 
         except FileNotFoundError as e:
             raise e
         except Exception as e:
             raise RuntimeError(f"Failed to load Kokoro model: {e}")
+
+    @staticmethod
+    def _resolve_amp_dtype(dtype_name: str):
+        """Map config strings to torch dtypes used by autocast."""
+        normalized = dtype_name.lower().strip()
+        if normalized == "fp32":
+            return None
+        if normalized == "fp16":
+            return torch.float16
+        if normalized == "bf16":
+            return torch.bfloat16
+        raise ValueError(
+            f"Unsupported AMP_DTYPE={dtype_name!r}; expected fp32, fp16, or bf16"
+        )
+
+    def _inference_context(self):
+        """Return the PyTorch context for model inference."""
+        grad_context = (
+            torch.inference_mode() if settings.use_inference_mode else torch.no_grad()
+        )
+        autocast_context = (
+            torch.amp.autocast("cuda", dtype=self._amp_dtype)
+            if self._is_cuda and self._amp_dtype is not None
+            else nullcontext()
+        )
+        return grad_context, autocast_context
 
     async def warmup_workers(self, lang_code: str) -> None:
         """Create per-thread G2P pipelines before serving concurrent traffic."""
@@ -142,18 +167,20 @@ class KokoroV1(BaseModelBackend):
 
     def _get_cuda_stream(self):
         """Return a CUDA stream local to each inference worker."""
-        if self._device != "cuda" or not settings.gpu_use_streams:
+        if not self._is_cuda or not settings.gpu_use_streams:
             return None
         stream = getattr(self._thread_local, "cuda_stream", None)
         if stream is None:
-            stream = torch.cuda.Stream()
+            stream = torch.cuda.Stream(device=self._torch_device)
             self._thread_local.cuda_stream = stream
         return stream
 
     def _load_voice_pack(self, voice_path: str) -> torch.Tensor:
         """Load and cache a voice pack on the target device."""
         if not model_config.cache_voices:
-            return torch.load(voice_path, weights_only=True).to(self._device)
+            return torch.load(voice_path, weights_only=True).to(
+                self._torch_device, non_blocking=True
+            )
 
         with self._voice_cache_lock:
             cached = self._voice_cache.get(voice_path)
@@ -161,7 +188,9 @@ class KokoroV1(BaseModelBackend):
                 self._voice_cache.move_to_end(voice_path)
                 return cached
 
-        pack = torch.load(voice_path, weights_only=True).to(self._device)
+        pack = torch.load(voice_path, weights_only=True).to(
+            self._torch_device, non_blocking=True
+        )
 
         with self._voice_cache_lock:
             cached = self._voice_cache.get(voice_path)
@@ -311,7 +340,8 @@ class KokoroV1(BaseModelBackend):
         )
         chunks = []
 
-        with torch.inference_mode(), stream_context:
+        grad_context, autocast_context = self._inference_context()
+        with grad_context, autocast_context, stream_context:
             for _, phonemes, tokens, _ in self._iter_text_segments(pipeline, text):
                 output = self._infer_phonemes_sync(phonemes, pack, speed)
                 if output.audio is None:
@@ -347,7 +377,8 @@ class KokoroV1(BaseModelBackend):
         )
         chunks = []
 
-        with torch.inference_mode(), stream_context:
+        grad_context, autocast_context = self._inference_context()
+        with grad_context, autocast_context, stream_context:
             if len(tokens) > 510:
                 raise ValueError(f"Phoneme string too long: {len(tokens)} > 510")
             output = self._infer_phonemes_sync(tokens, pack, speed)
@@ -386,7 +417,7 @@ class KokoroV1(BaseModelBackend):
             raise RuntimeError("Model not loaded")
 
         try:
-            if self._device == "cuda":
+            if self._is_cuda:
                 if self._check_memory():
                     self._clear_memory()
 
@@ -409,7 +440,7 @@ class KokoroV1(BaseModelBackend):
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             if (
-                self._device == "cuda"
+                self._is_cuda
                 and model_config.pytorch_gpu.retry_on_oom
                 and "out of memory" in str(e).lower()
             ):
@@ -445,7 +476,7 @@ class KokoroV1(BaseModelBackend):
         if not self.is_loaded:
             raise RuntimeError("Model not loaded")
         try:
-            if self._device == "cuda":
+            if self._is_cuda:
                 if self._check_memory():
                     self._clear_memory()
 
@@ -469,7 +500,7 @@ class KokoroV1(BaseModelBackend):
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             if (
-                self._device == "cuda"
+                self._is_cuda
                 and model_config.pytorch_gpu.retry_on_oom
                 and "out of memory" in str(e).lower()
             ):
@@ -480,17 +511,17 @@ class KokoroV1(BaseModelBackend):
 
     def _check_memory(self) -> bool:
         """Check if memory usage is above threshold."""
-        if self._device == "cuda":
-            memory_gb = torch.cuda.memory_allocated() / 1e9
+        if self._is_cuda:
+            memory_gb = torch.cuda.memory_allocated(self._torch_device) / 1e9
             return memory_gb > model_config.pytorch_gpu.memory_threshold
         # MPS doesn't provide memory management APIs
         return False
 
     def _clear_memory(self) -> None:
         """Clear device memory."""
-        if self._device == "cuda":
+        if self._is_cuda:
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(self._torch_device)
         elif self._device == "mps":
             # Empty cache if available (future-proofing)
             if hasattr(torch.mps, "empty_cache"):
@@ -512,7 +543,8 @@ class KokoroV1(BaseModelBackend):
         self._executor.shutdown(wait=False, cancel_futures=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            if self._is_cuda:
+                torch.cuda.synchronize(self._torch_device)
 
     @property
     def is_loaded(self) -> bool:

@@ -39,6 +39,7 @@ def load_openai_mappings() -> Dict:
 
 # Global mappings
 _openai_mappings = load_openai_mappings()
+_voice_validation_cache: Dict[str, str] = {}
 
 
 router = APIRouter(
@@ -88,6 +89,11 @@ async def process_and_validate_voices(
     Returns:
         Voice name to use (with weights if specified)
     """
+    cache_key = json.dumps(voice_input, sort_keys=True)
+    cached_voice = _voice_validation_cache.get(cache_key)
+    if cached_voice is not None:
+        return cached_voice
+
     voices = []
     # Convert input to list of voices
     if isinstance(voice_input, str):
@@ -129,7 +135,9 @@ async def process_and_validate_voices(
 
         voices[voice_index] = "(".join(mapped_voice)
 
-    return "".join(voices)
+    resolved_voice = "".join(voices)
+    _voice_validation_cache[cache_key] = resolved_voice
+    return resolved_voice
 
 
 async def stream_audio_chunks(

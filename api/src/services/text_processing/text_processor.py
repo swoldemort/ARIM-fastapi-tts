@@ -148,7 +148,7 @@ async def smart_split(
     """
     start_time = time.time()
     chunk_count = 0
-    logger.info(f"Starting smart split for {len(text)} chars")
+    logger.debug(f"Starting smart split for {len(text)} chars")
 
     # --- Step 1: Split by Pause Tags FIRST ---
     # This operates on the raw input text
@@ -176,7 +176,7 @@ async def smart_split(
 
                     processed_text = "".join(processed_text).strip()
                 else:
-                    logger.info(
+                    logger.debug(
                         "Skipping text normalization as it is only supported for english"
                     )
 
@@ -259,7 +259,7 @@ async def smart_split(
                     # yield current chunk and start new one
                     chunk_text = " ".join(current_chunk).strip()
                     chunk_count += 1
-                    logger.info(
+                    logger.debug(
                         f"Yielding chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(processed_text) > 50 else ''}' ({current_count} tokens)"
                     )
                     yield chunk_text, current_tokens, None
@@ -284,7 +284,7 @@ async def smart_split(
                     if current_chunk:
                         chunk_text = " ".join(current_chunk).strip()
                         chunk_count += 1
-                        logger.info(
+                        logger.debug(
                             f"Yielding chunk {chunk_count}: '{chunk_text[:50]}{'...' if len(processed_text) > 50 else ''}' ({current_count} tokens)"
                         )
                         yield chunk_text, current_tokens, None
@@ -296,7 +296,7 @@ async def smart_split(
             if current_chunk:
                 chunk_text = " ".join(current_chunk).strip()
                 chunk_count += 1
-                logger.info(
+                logger.debug(
                     f"Yielding final chunk {chunk_count} for part: '{chunk_text[:50]}{'...' if len(processed_text) > 50 else ''}' ({current_count} tokens)"
                 )
                 yield chunk_text, current_tokens, None
@@ -312,7 +312,7 @@ async def smart_split(
                     duration = float(duration_str)
                     if duration > 0:
                         chunk_count += 1
-                        logger.info(f"Yielding pause chunk {chunk_count}: {duration}s")
+                        logger.debug(f"Yielding pause chunk {chunk_count}: {duration}s")
                         yield "", [], duration  # Yield pause chunk
                 except (ValueError, TypeError):
                     # This case should be rare if re.fullmatch passed, but handle anyway
@@ -320,6 +320,6 @@ async def smart_split(
 
     # --- End of parts loop ---
     total_time = time.time() - start_time
-    logger.info(
+    logger.debug(
         f"Split completed in {total_time * 1000:.2f}ms, produced {chunk_count} chunks (including pauses)"
     )
