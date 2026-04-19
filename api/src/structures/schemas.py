@@ -4,6 +4,8 @@ from typing import List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from ..core.config import settings
+
 
 class VoiceCombineRequest(BaseModel):
     """Request schema for voice combination endpoint that accepts either a string with + or a list"""
@@ -86,7 +88,7 @@ class OpenAISpeechRequest(BaseModel):
         description="The voice to use for generation. Can be a base voice or a combined voice name.",
     )
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(
-        default="mp3",
+        default=settings.default_response_format,
         description="The format to return audio in. Supported formats: mp3, opus, flac, wav, pcm. PCM format returns raw 16-bit samples without headers. AAC is not currently supported.",
     )
     download_format: Optional[Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]] = (
@@ -102,8 +104,8 @@ class OpenAISpeechRequest(BaseModel):
         description="The speed of the generated audio. Select a value from 0.25 to 4.0.",
     )
     stream: bool = Field(
-        default=True,  # Default to streaming for OpenAI compatibility
-        description="If true (default), audio will be streamed as it's generated. Each chunk will be a complete sentence.",
+        default=settings.default_stream,
+        description="If true, audio will be streamed as it's generated. Keep false for a complete LiveKit-compatible file response.",
     )
     return_download_link: bool = Field(
         default=False,
@@ -136,7 +138,7 @@ class CaptionedSpeechRequest(BaseModel):
         description="The voice to use for generation. Can be a base voice or a combined voice name.",
     )
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(
-        default="mp3",
+        default=settings.default_response_format,
         description="The format to return audio in. Supported formats: mp3, opus, flac, wav, pcm. PCM format returns raw 16-bit samples without headers. AAC is not currently supported.",
     )
     speed: float = Field(
@@ -146,8 +148,8 @@ class CaptionedSpeechRequest(BaseModel):
         description="The speed of the generated audio. Select a value from 0.25 to 4.0.",
     )
     stream: bool = Field(
-        default=True,  # Default to streaming for OpenAI compatibility
-        description="If true (default), audio will be streamed as it's generated. Each chunk will be a complete sentence.",
+        default=settings.default_stream,
+        description="If true, audio will be streamed as it's generated. Keep false for a complete LiveKit-compatible file response.",
     )
     return_timestamps: bool = Field(
         default=True,

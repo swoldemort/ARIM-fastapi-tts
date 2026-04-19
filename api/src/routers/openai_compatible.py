@@ -212,10 +212,10 @@ async def create_speech(
             "pcm": "audio/pcm",
         }.get(request.response_format, f"audio/{request.response_format}")
 
-        writer = StreamingAudioWriter(request.response_format, sample_rate=24000)
-
         # Check if streaming is requested (default for OpenAI client)
         if request.stream:
+            writer = StreamingAudioWriter(request.response_format, sample_rate=24000)
+
             # Create generator but don't start it yet
             generator = stream_audio_chunks(
                 tts_service, request, client_request, writer
@@ -302,6 +302,15 @@ async def create_speech(
                 "Content-Disposition": f"attachment; filename=speech.{request.response_format}",
                 "Cache-Control": "no-cache",  # Prevent caching
             }
+            fast_complete_format = request.response_format in {"wav", "pcm"} and (
+                not request.return_download_link
+                or request.download_format in {None, request.response_format}
+            )
+            writer = (
+                None
+                if fast_complete_format
+                else StreamingAudioWriter(request.response_format, sample_rate=24000)
+            )
 
             # Generate complete audio using public interface
             audio_data = await tts_service.generate_audio(
@@ -314,22 +323,27 @@ async def create_speech(
                 lang_code=request.lang_code,
             )
 
-            audio_data = await AudioService.convert_audio(
-                audio_data,
-                request.response_format,
-                writer,
-                is_last_chunk=False,
-                trim_audio=False,
-            )
+            if fast_complete_format:
+                output = AudioService.encode_complete_audio(
+                    audio_data, request.response_format
+                )
+            else:
+                audio_data = await AudioService.convert_audio(
+                    audio_data,
+                    request.response_format,
+                    writer,
+                    is_last_chunk=False,
+                    trim_audio=False,
+                )
 
-            # Convert to requested format with proper finalization
-            final = await AudioService.convert_audio(
-                AudioChunk(np.array([], dtype=np.int16)),
-                request.response_format,
-                writer,
-                is_last_chunk=True,
-            )
-            output = audio_data.output + final.output
+                # Convert to requested format with proper finalization
+                final = await AudioService.convert_audio(
+                    AudioChunk(np.array([], dtype=np.int16)),
+                    request.response_format,
+                    writer,
+                    is_last_chunk=True,
+                )
+                output = audio_data.output + final.output
 
             if request.return_download_link:
                 from ..services.temp_manager import TempFileWriter
@@ -358,7 +372,8 @@ async def create_speech(
                     # Ensure temp writer is closed
                     if not temp_writer._finalized:
                         await temp_writer.__aexit__(None, None, None)
-                    writer.close()
+                    if writer:
+                        writer.close()
 
             return Response(
                 content=output,

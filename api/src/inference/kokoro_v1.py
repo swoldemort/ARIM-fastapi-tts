@@ -37,6 +37,7 @@ class KokoroV1(BaseModelBackend):
         self._model: Optional[KModel] = None
         self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
         self._pipeline_lock = threading.Lock()
+        self._rnn_flatten_lock = threading.Lock()
         self._worker_pipelines: Dict[Tuple[int, str], KPipeline] = {}
         self._voice_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._voice_cache_lock = threading.Lock()
@@ -76,6 +77,7 @@ class KokoroV1(BaseModelBackend):
             if self._torch_device.type == "mps":
                 logger.info("Moving model to MPS device")
             self._model = self._model.to(self._torch_device)
+            self._flatten_rnn_parameters()
 
         except FileNotFoundError as e:
             raise e
@@ -108,6 +110,22 @@ class KokoroV1(BaseModelBackend):
         )
         return grad_context, autocast_context
 
+    def _flatten_rnn_parameters(self, log: bool = True) -> None:
+        """Keep RNN weights contiguous to avoid per-call cuDNN repacking."""
+        if not self._model:
+            return
+
+        flattened = 0
+        with self._rnn_flatten_lock:
+            for module in self._model.modules():
+                flatten = getattr(module, "flatten_parameters", None)
+                if flatten is not None:
+                    flatten()
+                    flattened += 1
+
+        if flattened and log:
+            logger.info(f"Flattened parameters for {flattened} recurrent modules")
+
     async def warmup_workers(self, lang_code: str) -> None:
         """Create per-thread G2P pipelines before serving concurrent traffic."""
         if not self.is_loaded or self._workers <= 1:
@@ -118,6 +136,9 @@ class KokoroV1(BaseModelBackend):
         def warmup_worker():
             barrier.wait()
             self._get_worker_pipeline(lang_code)
+            # The warmup request can invalidate cuDNN's packed RNN layout later in
+            # startup, so force one cheap flatten on the first real request.
+            self._thread_local.rnn_flattened = False
 
         loop = asyncio.get_running_loop()
         await asyncio.gather(
@@ -146,6 +167,8 @@ class KokoroV1(BaseModelBackend):
                     self._pipelines[lang_code] = KPipeline(
                         lang_code=lang_code, model=self._model, device=self._device
                     )
+                    self._flatten_rnn_parameters()
+                    self._thread_local.rnn_flattened = False
         return self._pipelines[lang_code]
 
     def _get_worker_pipeline(self, lang_code: str) -> KPipeline:
@@ -163,6 +186,8 @@ class KokoroV1(BaseModelBackend):
                         lang_code=lang_code, model=False, device=self._device
                     )
                     self._worker_pipelines[key] = pipeline
+                    self._flatten_rnn_parameters()
+                    self._thread_local.rnn_flattened = False
         return pipeline
 
     def _get_cuda_stream(self):
@@ -319,6 +344,9 @@ class KokoroV1(BaseModelBackend):
         """Infer one phoneme string using the configured Kokoro model."""
         if not self._model:
             raise RuntimeError("Model not loaded")
+        if self._is_cuda and not getattr(self._thread_local, "rnn_flattened", False):
+            self._flatten_rnn_parameters(log=False)
+            self._thread_local.rnn_flattened = True
         return KPipeline.infer(self._model, phonemes, pack, speed)
 
     def _generate_text_sync(
@@ -512,8 +540,14 @@ class KokoroV1(BaseModelBackend):
     def _check_memory(self) -> bool:
         """Check if memory usage is above threshold."""
         if self._is_cuda:
-            memory_gb = torch.cuda.memory_allocated(self._torch_device) / 1e9
-            return memory_gb > model_config.pytorch_gpu.memory_threshold
+            threshold = model_config.pytorch_gpu.memory_threshold
+            memory_allocated = torch.cuda.memory_allocated(self._torch_device)
+            if threshold <= 1:
+                total_memory = torch.cuda.get_device_properties(
+                    self._torch_device
+                ).total_memory
+                return (memory_allocated / total_memory) > threshold
+            return (memory_allocated / 1e9) > threshold
         # MPS doesn't provide memory management APIs
         return False
 

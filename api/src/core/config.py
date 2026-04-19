@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     # Audio Settings
     sample_rate: int = 24000
     default_volume_multiplier: float = 1.0
+    default_response_format: str = "pcm"
+    default_stream: bool = True
     mp3_bitrate: int = 128000
     # Text Processing Settings
     target_min_tokens: int = 175  # Target minimum tokens per chunk

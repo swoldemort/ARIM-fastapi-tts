@@ -3,6 +3,7 @@
 import math
 import struct
 import time
+import wave
 from io import BytesIO
 from typing import Tuple
 
@@ -126,6 +127,26 @@ class AudioService:
             "bitrate": "192k",  # Default AAC bitrate
         },
     }
+
+    @staticmethod
+    def encode_complete_audio(audio_chunk: AudioChunk, output_format: str) -> bytes:
+        """Encode complete non-streaming audio without PyAV for cheap raw formats."""
+        if output_format not in {"wav", "pcm"}:
+            raise ValueError(f"Fast complete encoding does not support {output_format}")
+
+        audio = AudioNormalizer().normalize(audio_chunk.audio)
+        audio = np.ascontiguousarray(audio, dtype=np.int16)
+
+        if output_format == "pcm":
+            return audio.tobytes()
+
+        output = BytesIO()
+        with wave.open(output, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(settings.sample_rate)
+            wav_file.writeframes(audio.tobytes())
+        return output.getvalue()
 
     @staticmethod
     async def convert_audio(
