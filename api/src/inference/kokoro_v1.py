@@ -38,6 +38,7 @@ class KokoroV1(BaseModelBackend):
         self._pipelines: Dict[str, KPipeline] = {}  # Store pipelines by lang_code
         self._pipeline_lock = threading.Lock()
         self._rnn_flatten_lock = threading.Lock()
+        self._rnn_layout_dirty = False
         self._worker_pipelines: Dict[Tuple[int, str], KPipeline] = {}
         self._voice_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._voice_cache_lock = threading.Lock()
@@ -122,9 +123,26 @@ class KokoroV1(BaseModelBackend):
                 if flatten is not None:
                     flatten()
                     flattened += 1
+            self._rnn_layout_dirty = False
 
         if flattened and log:
             logger.info(f"Flattened parameters for {flattened} recurrent modules")
+
+    def _mark_rnn_layout_dirty(self) -> None:
+        """Mark cuDNN RNN layout dirty after pipeline setup touches model state."""
+        if not self._is_cuda:
+            return
+        with self._rnn_flatten_lock:
+            self._rnn_layout_dirty = True
+
+    def _ensure_rnn_parameters_flattened(self) -> None:
+        """Flatten once after pipeline creation instead of once per worker."""
+        if not self._is_cuda:
+            return
+        with self._rnn_flatten_lock:
+            needs_flatten = self._rnn_layout_dirty
+        if needs_flatten:
+            self._flatten_rnn_parameters(log=False)
 
     async def warmup_workers(self, lang_code: str) -> None:
         """Create per-thread G2P pipelines before serving concurrent traffic."""
@@ -136,9 +154,6 @@ class KokoroV1(BaseModelBackend):
         def warmup_worker():
             barrier.wait()
             self._get_worker_pipeline(lang_code)
-            # The warmup request can invalidate cuDNN's packed RNN layout later in
-            # startup, so force one cheap flatten on the first real request.
-            self._thread_local.rnn_flattened = False
 
         loop = asyncio.get_running_loop()
         await asyncio.gather(
@@ -147,6 +162,7 @@ class KokoroV1(BaseModelBackend):
                 for _ in range(self._workers)
             ]
         )
+        self._ensure_rnn_parameters_flattened()
 
     def _get_pipeline(self, lang_code: str) -> KPipeline:
         """Get or create pipeline for language code.
@@ -167,8 +183,7 @@ class KokoroV1(BaseModelBackend):
                     self._pipelines[lang_code] = KPipeline(
                         lang_code=lang_code, model=self._model, device=self._device
                     )
-                    self._flatten_rnn_parameters()
-                    self._thread_local.rnn_flattened = False
+                    self._mark_rnn_layout_dirty()
         return self._pipelines[lang_code]
 
     def _get_worker_pipeline(self, lang_code: str) -> KPipeline:
@@ -186,8 +201,7 @@ class KokoroV1(BaseModelBackend):
                         lang_code=lang_code, model=False, device=self._device
                     )
                     self._worker_pipelines[key] = pipeline
-                    self._flatten_rnn_parameters()
-                    self._thread_local.rnn_flattened = False
+                    self._mark_rnn_layout_dirty()
         return pipeline
 
     def _get_cuda_stream(self):
@@ -344,9 +358,7 @@ class KokoroV1(BaseModelBackend):
         """Infer one phoneme string using the configured Kokoro model."""
         if not self._model:
             raise RuntimeError("Model not loaded")
-        if self._is_cuda and not getattr(self._thread_local, "rnn_flattened", False):
-            self._flatten_rnn_parameters(log=False)
-            self._thread_local.rnn_flattened = True
+        self._ensure_rnn_parameters_flattened()
         return KPipeline.infer(self._model, phonemes, pack, speed)
 
     def _generate_text_sync(
